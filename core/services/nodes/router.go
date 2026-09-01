@@ -629,7 +629,11 @@ func (r *SmartRouter) Route(ctx context.Context, modelID, modelName, backendType
 	// nodeMatchesScheduling all read it. Fetching once gives a consistent
 	// snapshot and avoids three DB round-trips for one row. nil sched means
 	// "no scheduling constraints", same as before.
-	sched, _ := r.registry.GetModelScheduling(ctx, trackingKey)
+	// GetGoverningScheduling, not GetModelScheduling: a rule may be keyed by an
+	// alias of this model. Request middleware resolves an alias to its target
+	// long before routing, so by here trackingKey is always the target's name
+	// and the alias's rule can only be found by resolving the other way.
+	sched, _ := r.registry.GetGoverningScheduling(ctx, trackingKey)
 
 	// Resolve the model's NodeSelector once so cached-replica lookup and the
 	// new-load scheduler agree on the candidate set. Without this, a cached
@@ -1047,7 +1051,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// Check for scheduling constraints (node selector). If a selector is set,
 	// we restrict the candidate pool to matching nodes; otherwise nil means
 	// "any healthy node".
-	sched, _ := r.registry.GetModelScheduling(ctx, modelID)
+	sched, _ := r.registry.GetGoverningScheduling(ctx, modelID)
 	candidateNodeIDs, err := r.resolveSelectorCandidates(ctx, modelID, sched)
 	if err != nil {
 		return nil, "", 0, err
@@ -1129,7 +1133,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 
 	// 4. Preemptive eviction: if no suitable node found, evict the LRU model with zero in-flight
 	if node == nil {
-		evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
+		evictedNode, evictErr := r.evictLRUAndFreeNodeFrom(ctx, candidateNodeIDs)
 		if evictErr != nil {
 			if errors.Is(evictErr, ErrEvictionBusy) {
 				return nil, "", 0, fmt.Errorf("no healthy nodes available: %w", evictErr)
@@ -1153,7 +1157,7 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 		// it can race with another concurrent scheduler.
 		xlog.Warn("Chosen node has no free replica slot, evicting LRU",
 			"node", node.Name, "model", modelID, "max_slots", maxSlots)
-		evictedNode, evictErr := r.evictLRUAndFreeNode(ctx)
+		evictedNode, evictErr := r.evictLRUAndFreeNodeFrom(ctx, candidateNodeIDs)
 		if evictErr != nil {
 			return nil, "", 0, fmt.Errorf("no replica slot on %s and eviction failed: %w", node.Name, evictErr)
 		}
@@ -1870,6 +1874,16 @@ func (r *SmartRouter) stageOptionDir(ctx context.Context, node *BackendNode, dir
 		if walkErr != nil || d.IsDir() {
 			return nil
 		}
+		// Same reason as stageDirectory: the receiver writes "<file>.sha256" for
+		// every file it accepts, so staging the sidecars makes it write sidecars
+		// for those in turn. Option dirs are walked on every load, so each pass
+		// added a level - an espeak-ng-data tree observed in the wild had grown
+		// to "<file>.sha256" repeated eleven times and 5077 junk files, which is
+		// enough to keep a sherpa-onnx voice permanently "staging" and fail
+		// every realtime warmup that needs it.
+		if isHashSidecar(path) {
+			return nil
+		}
 		if _, err := r.fileStager.EnsureRemote(ctx, node.ID, path, keyFn(path)); err != nil {
 			xlog.Warn("Failed to stage option directory file, skipping", "path", path, "error", err)
 		}
@@ -1979,7 +1993,23 @@ var ErrEvictionBusy = errors.New("all models busy, cannot evict")
 // Uses SELECT FOR UPDATE inside a transaction to prevent two frontends from
 // simultaneously picking the same eviction target. The NodeModel row is deleted
 // inside the transaction; the NATS unload command is sent after commit.
+// evictLRUAndFreeNode evicts across every healthy node. Callers that hold a
+// candidate set must use evictLRUAndFreeNodeFrom instead.
 func (r *SmartRouter) evictLRUAndFreeNode(ctx context.Context) (*BackendNode, error) {
+	return r.evictLRUAndFreeNodeFrom(ctx, nil)
+}
+
+// evictLRUAndFreeNodeFrom evicts the least-recently-used idle model from one of
+// candidateNodeIDs, or from any healthy node when the set is nil.
+//
+// Restricting eviction to the candidate set matters whenever the model being
+// scheduled has a node selector. Evicting globally freed a slot on a node the
+// selector forbids, so the model was then placed there anyway, on hardware it
+// was explicitly pinned away from, and an unrelated model was dropped to make
+// the room. On a cluster where the selector-matching node was momentarily
+// unavailable this repeated, and the evicted model appeared to bounce between
+// nodes.
+func (r *SmartRouter) evictLRUAndFreeNodeFrom(ctx context.Context, candidateNodeIDs []string) (*BackendNode, error) {
 	const maxEvictionRetries = 5
 	const evictionRetryInterval = 500 * time.Millisecond
 
@@ -1990,17 +2020,32 @@ func (r *SmartRouter) evictLRUAndFreeNode(ctx context.Context) (*BackendNode, er
 	for attempt := range maxEvictionRetries {
 		var lru NodeModel
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Lock the row so no other frontend can evict the same model
-			if err := currentModelRevision(tx.Clauses(clause.Locking{Strength: "UPDATE"})).
+			// Lock the row so no other frontend can evict the same model.
+			//
+			// The replica-floor guard matches a rule to a replica through
+			// sc.target_model, so a rule keyed by an alias protects the model
+			// the alias points at. It falls back to sc.model_name when the
+			// stored target is empty, which keeps a rule inserted by some path
+			// that never resolved it protecting itself rather than nothing.
+			//
+			// target_model is not unique (two names can resolve to one model),
+			// so the floor is MAX over the matching rules: only one of them
+			// governs, but over-protecting costs a retry while under-protecting
+			// evicts below a floor the reconciler then has to rebuild.
+			q := currentModelRevision(tx.Clauses(clause.Locking{Strength: "UPDATE"})).
 				Joins("JOIN backend_nodes ON backend_nodes.id = node_models.node_id").
 				Where(`node_models.in_flight = 0 AND node_models.state = ? AND backend_nodes.status = ?
   AND (
-    NOT EXISTS (SELECT 1 FROM model_scheduling_configs sc WHERE sc.model_name = node_models.model_name AND (sc.min_replicas > 0 OR sc.max_replicas > 0))
+    NOT EXISTS (SELECT 1 FROM model_scheduling_configs sc WHERE COALESCE(NULLIF(sc.target_model, ''), sc.model_name) = node_models.model_name AND (sc.min_replicas > 0 OR sc.max_replicas > 0))
     OR (SELECT COUNT(*) FROM node_models nm2 WHERE nm2.model_name = node_models.model_name AND nm2.state = 'loaded'
          AND (NOT EXISTS (SELECT 1 FROM model_config_states mcs2 WHERE mcs2.model_name = nm2.model_name)
               OR nm2.config_revision = (SELECT mcs3.config_revision FROM model_config_states mcs3 WHERE mcs3.model_name = nm2.model_name)))
-       > COALESCE((SELECT sc2.min_replicas FROM model_scheduling_configs sc2 WHERE sc2.model_name = node_models.model_name), 1)
-  )`, "loaded", StatusHealthy).
+       > COALESCE((SELECT MAX(sc2.min_replicas) FROM model_scheduling_configs sc2 WHERE COALESCE(NULLIF(sc2.target_model, ''), sc2.model_name) = node_models.model_name), 1)
+  )`, "loaded", StatusHealthy)
+			if len(candidateNodeIDs) > 0 {
+				q = q.Where("node_models.node_id IN ?", candidateNodeIDs)
+			}
+			if err := q.
 				Order("node_models.last_used ASC").
 				First(&lru).Error; err != nil {
 				return err

@@ -486,6 +486,43 @@ Used by the WebUI and admin API consumers. Requires admin authentication.
 
 The **Nodes** page in the React WebUI provides a visual overview of all registered workers, their statuses, and loaded models. The page opens with a one-line **cluster pulse** summarising node health and an **attention callout** that surfaces nodes needing action (for example pending approvals). Below that, a roster of **node panels** lists each worker with its inline model chips (no expand click needed), filtered by an **All / Backend / Agent** segmented control. Selecting a panel opens a dedicated **node detail page** at `/app/nodes/:id` with per-node metrics, models, and backend actions. Model scheduling lives on its own **Scheduling** page (separate nav item), not as a tab on the Nodes page.
 
+### Model sizing in the WebUI
+
+The model gallery answers "will this model run here" against the cluster, not
+against the frontend. A distributed frontend is usually a GPU-less pod, so
+sizing models against its own memory would report that a fleet of GPU workers
+can only run the smallest CPU build.
+
+The budget is the **largest single healthy backend node**, not the sum of the
+fleet: a model loads into one node, so four 16GB workers do not add up to a home
+for a 40GB model. A node's operator-set VRAM budget caps its contribution, since
+the scheduler would refuse a load above that ceiling anyway, and a GPU node wins
+over a CPU node holding more system RAM. The gallery names the node its verdict
+belongs to ("Fits on dgx-01").
+
+`GET /api/resources` and `GET /api/models` carry this as an additional `cluster`
+object; their existing `aggregate` and `ram*` fields keep reporting the
+frontend's own hardware, which is what the resource monitor shows. The object is
+absent in single-node mode, and also whenever the registry cannot be read, in
+which case every sizing surface falls back to the local host:
+
+```json
+{
+  "cluster": {
+    "enabled": true,
+    "node_id": "a1b2c3",
+    "node_name": "dgx-01",
+    "total_memory": 85899345920,
+    "is_gpu": true,
+    "node_count": 4
+  }
+}
+```
+
+Variant selection (`GET /api/models/variants/:id`) uses the same reading, and
+judges backend compatibility against the union of the capabilities present in
+the cluster, so a CUDA-only build is offered when any worker can run it.
+
 ### Model configuration revisions
 
 Distributed mode assigns a `config_revision` to each validated model configuration. It hashes the persisted semantic configuration, including fields such as `context_size` and parallel settings. YAML formatting, comments, and map order do not change it.
@@ -836,6 +873,12 @@ curl -X POST http://frontend:8080/api/nodes/scheduling \
 
 Without a node selector, models can schedule on any healthy node (default behavior).
 
+In the WebUI, the node selector field completes what you type against the labels
+your cluster actually reports: start typing a key and the matching label keys
+appear inline, then the value field offers only the values that key takes. A key
+no node reports yet is still accepted as typed, so you can write a rule before
+labelling the nodes for it.
+
 ### Replica Auto-Scaling
 
 Control the number of model replicas across the cluster:
@@ -870,6 +913,40 @@ All fields are optional and composable:
 - Node selector only: pin model to matching nodes, single replica
 - Replicas only: auto-scale across all nodes
 - Both: auto-scale on matching nodes only
+
+### Scheduling a model alias
+
+`model_name` accepts a [model alias](/features/model-aliases/) as well as a
+model. A rule keyed by an alias governs whatever model that alias currently
+points at, and keeps governing it after you repoint the alias:
+
+```bash
+# "production" is an alias for llama3
+curl -X POST http://frontend:8080/api/nodes/scheduling \
+  -H "Content-Type: application/json" \
+  -d '{"model_name": "production", "node_selector": {"tier": "gpu"}, "min_replicas": 2}'
+
+# Repoint the alias at a new model: the rule follows, llama4 now runs
+# two replicas on the GPU tier and llama3 falls back to on-demand placement.
+```
+
+This makes an alias a stable deployment slot: the placement policy belongs to
+the slot, and the model filling it can change without rewriting the rule. The
+WebUI lists aliases in the model picker on the **Scheduling** page, tagged with
+the model each one resolves to.
+
+Two constraints follow from replicas being shared. A single load of `llama3`
+serves both `production` and any request that names `llama3` directly, so only
+one rule can decide where it runs: a rule whose target is already governed by
+another rule is rejected with `409 Conflict` naming the rule that has it. And a
+rule keyed by an alias that resolves to nothing (its target was deleted, or it
+points at another alias) is rejected, since it would govern nothing loadable.
+
+A rule can still end up inert if the pair is created some other way, for example
+by a declarative seed or by repointing an alias onto a model that already has a
+rule. The rule that governs is the one keyed by the model's own name, or failing
+that the oldest one; the rest are listed as **Shadowed** in the WebUI and carry
+`"shadowed": true` in `GET /api/nodes/scheduling`.
 
 ### Declarative per-model scheduling (unattended installs)
 
