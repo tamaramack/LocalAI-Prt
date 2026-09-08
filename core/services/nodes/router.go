@@ -1098,9 +1098,16 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	// carries the install. A worker that has died stops answering on the bus at
 	// once but stays healthy in the database until its heartbeat ages out, so
 	// without this the scheduler could commit to a node it cannot reach.
+	//
+	// The last selection error is kept because eviction below fires on a nil
+	// node, and a lookup that failed is not the same answer as a cluster with
+	// no room: a control-plane database slow enough to time out these queries
+	// read as "everybody is full" and cost a healthy model its place.
+	var selectErr error
 	selectNode := func() *BackendNode {
 		var candidate *BackendNode
 		var selErr error
+		selectErr = nil
 		if estimatedVRAM > 0 {
 			if candidateNodeIDs != nil {
 				candidate, selErr = r.registry.FindNodeWithVRAMFromSet(ctx, estimatedVRAM, candidateNodeIDs)
@@ -1117,19 +1124,30 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 			if candidateNodeIDs != nil {
 				candidate, selErr = r.registry.FindIdleNodeFromSet(ctx, candidateNodeIDs)
 				if selErr != nil {
-					candidate, _ = r.registry.FindLeastLoadedNodeFromSet(ctx, candidateNodeIDs)
+					candidate, selErr = r.registry.FindLeastLoadedNodeFromSet(ctx, candidateNodeIDs)
 				}
 			} else {
 				candidate, selErr = r.registry.FindIdleNode(ctx)
 				if selErr != nil {
-					candidate, _ = r.registry.FindLeastLoadedNode(ctx)
+					candidate, selErr = r.registry.FindLeastLoadedNode(ctx)
 				}
+			}
+			if candidate == nil {
+				selectErr = selErr
 			}
 		}
 		return candidate
 	}
 
 	node := r.pickReachableNode(ctx, selectNode)
+
+	// Same reasoning as the replica-slot guard further down: only
+	// gorm.ErrRecordNotFound is a verdict that the cluster has no node to give.
+	// Any other error left the question unanswered, and evicting on it costs a
+	// healthy model its place for no evidence.
+	if node == nil && selectErr != nil && !errors.Is(selectErr, gorm.ErrRecordNotFound) {
+		return nil, "", 0, fmt.Errorf("selecting a node for %s: %w", modelID, selectErr)
+	}
 
 	// 4. Preemptive eviction: if no suitable node found, evict the LRU model with zero in-flight
 	if node == nil {
@@ -1152,6 +1170,15 @@ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID
 	}
 	replicaIdx, slotErr := r.registry.NextFreeReplicaIndex(ctx, node.ID, modelID, maxSlots)
 	if slotErr != nil {
+		// Only ErrNoFreeSlot means "this node is full". Any other error means
+		// we could not find out, and evicting on a guess costs a healthy model
+		// its place: a control-plane database slow enough to time out this
+		// lookup made the scheduler evict loaded models it had no evidence to
+		// evict, and they thrashed.
+		if !errors.Is(slotErr, ErrNoFreeSlot) {
+			return nil, "", 0, fmt.Errorf("determining free replica slot on %s: %w", node.Name, slotErr)
+		}
+
 		// All slots on this node are taken — fall back to eviction. This is
 		// rare in practice because FindNodesWithFreeSlot already filtered;
 		// it can race with another concurrent scheduler.
@@ -1572,8 +1599,15 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 
 	// Stage file paths referenced in generic Options (key:value pairs where values
 	// are file paths). Options stay as relative paths — backends resolve them via ModelPath.
-	r.stageGenericOptions(ctx, node, opts.Options, frontendModelsDir, localModelDir, keyMapper.Key)
-	r.stageGenericOptions(ctx, node, opts.Overrides, frontendModelsDir, localModelDir, keyMapper.Key)
+	for _, options := range [][]string{opts.Options, opts.Overrides} {
+		remoteRoot := r.stageGenericOptions(ctx, node, options, frontendModelsDir, localModelDir, keyMapper.Key)
+		if opts.ModelFile == "" && remoteRoot != "" {
+			// Virtual models have no primary file from which to derive the
+			// worker root. Their relative options must resolve against the
+			// companion assets we actually staged, not the frontend's root.
+			opts.ModelPath = remoteRoot
+		}
+	}
 
 	return opts, nil
 }
@@ -1804,7 +1838,9 @@ func (r *SmartRouter) stageCompanionFiles(ctx context.Context, node *BackendNode
 // that resolve to existing files relative to the frontend models directory or
 // the model's own directory. Option values are NOT rewritten — backends resolve
 // them via ModelPath. keyFn generates the namespaced storage key for each file.
-func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode, options []string, frontendModelsDir, modelDir string, keyFn func(string) string) {
+// Returns the staged models root, or empty when no asset was staged.
+func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode, options []string, frontendModelsDir, modelDir string, keyFn func(string) string) string {
+	remoteRoot := ""
 	for _, opt := range options {
 		optKey, val, ok := strings.Cut(opt, ":")
 		if !ok || val == "" {
@@ -1829,18 +1865,23 @@ func (r *SmartRouter) stageGenericOptions(ctx context.Context, node *BackendNode
 		// worker; a single file is staged directly. Values are never rewritten —
 		// backends resolve relative paths via ModelPath.
 		if err == nil && info.IsDir() {
-			r.stageOptionDir(ctx, node, absPath, keyFn)
+			if remoteDir := r.stageOptionDir(ctx, node, absPath, keyFn); remoteDir != "" {
+				remoteRoot = DeriveRemoteModelPath(remoteDir, relativeToModelsDir(frontendModelsDir, absPath, filepath.Base(absPath)))
+			}
 			xlog.Debug("Staged option directory", "option", optKey, "localPath", absPath)
 			continue
 		}
 
 		key := keyFn(absPath)
-		if _, err := r.fileStager.EnsureRemote(ctx, node.ID, absPath, key); err != nil {
+		remotePath, err := r.fileStager.EnsureRemote(ctx, node.ID, absPath, key)
+		if err != nil {
 			xlog.Warn("Failed to stage option file, skipping", "option", opt, "path", absPath, "error", err)
 			continue
 		}
+		remoteRoot = DeriveRemoteModelPath(remotePath, relativeToModelsDir(frontendModelsDir, absPath, filepath.Base(absPath)))
 		xlog.Debug("Staged option file", "option", optKey, "localPath", absPath)
 	}
+	return remoteRoot
 }
 
 // resolveOptionPath finds an existing local path for an option value: an
@@ -1868,8 +1909,10 @@ func resolveOptionPath(val, frontendModelsDir, modelDir string) (string, bool) {
 // stageOptionDir stages every regular file under an option-declared directory
 // (e.g. sherpa-onnx's espeak-ng-data) using the structure-preserving key, so the
 // tree is recreated beside the model on the worker. Per-file errors are logged
-// and skipped; the option value itself is not rewritten.
-func (r *SmartRouter) stageOptionDir(ctx context.Context, node *BackendNode, dir string, keyFn func(string) string) {
+// and skipped; the option value itself is not rewritten. Returns the remote
+// directory derived from a successfully staged file, or empty when none succeeds.
+func (r *SmartRouter) stageOptionDir(ctx context.Context, node *BackendNode, dir string, keyFn func(string) string) string {
+	remoteDir := ""
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.IsDir() {
 			return nil
@@ -1884,11 +1927,17 @@ func (r *SmartRouter) stageOptionDir(ctx context.Context, node *BackendNode, dir
 		if isHashSidecar(path) {
 			return nil
 		}
-		if _, err := r.fileStager.EnsureRemote(ctx, node.ID, path, keyFn(path)); err != nil {
+		remotePath, err := r.fileStager.EnsureRemote(ctx, node.ID, path, keyFn(path))
+		if err != nil {
 			xlog.Warn("Failed to stage option directory file, skipping", "path", path, "error", err)
+			return nil
+		}
+		if rel, err := filepath.Rel(dir, path); err == nil {
+			remoteDir = DeriveRemoteModelPath(remotePath, rel)
 		}
 		return nil
 	})
+	return remoteDir
 }
 
 // probeHealth checks whether a backend process on the given node/addr is alive
